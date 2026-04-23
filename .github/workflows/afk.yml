@@ -4,7 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       account_id:
-        description: "Account ID (khớp với secret MSA_CACHE_<id>)"
+        description: "Account ID (UUID, dùng để tên folder auth-cache)"
+        required: true
+      secret_suffix:
+        description: "Suffix của secret name (đã sanitize A-Z/0-9/_)"
+        required: true
+      msa_cache_filename:
+        description: "Tên file cache MSA gốc (vd: 77b833_bed-cache.json)"
         required: true
       webhook_url:
         description: "HTTPS endpoint của manager local (ngrok/cloudflare tunnel URL)"
@@ -51,15 +57,16 @@ jobs:
 
       - name: Restore MSA cache from secret
         env:
-          MSA_CACHE_B64: ${{ secrets[format('MSA_CACHE_{0}', inputs.account_id)] }}
+          MSA_CACHE_B64: ${{ secrets[format('MSA_CACHE_{0}', inputs.secret_suffix)] }}
         run: |
           if [ -z "$MSA_CACHE_B64" ]; then
-            echo "::error::Missing repo secret MSA_CACHE_${{ inputs.account_id }}"
+            echo "::error::Missing repo secret MSA_CACHE_${{ inputs.secret_suffix }}"
             exit 1
           fi
           mkdir -p .auth-cache/${{ inputs.account_id }}
-          echo "$MSA_CACHE_B64" | base64 -d > .auth-cache/${{ inputs.account_id }}/bed-cache.json
-          echo "MSA cache restored ($(wc -c < .auth-cache/${{ inputs.account_id }}/bed-cache.json) bytes)"
+          TARGET=".auth-cache/${{ inputs.account_id }}/${{ inputs.msa_cache_filename }}"
+          echo "$MSA_CACHE_B64" | base64 -d > "$TARGET"
+          echo "MSA cache restored to $TARGET ($(wc -c < "$TARGET") bytes)"
 
       - name: Run AFK Bot
         env:
@@ -85,6 +92,8 @@ jobs:
                 ref: context.ref,
                 inputs: {
                   account_id: '${{ inputs.account_id }}',
+                  secret_suffix: '${{ inputs.secret_suffix }}',
+                  msa_cache_filename: '${{ inputs.msa_cache_filename }}',
                   webhook_url: '${{ inputs.webhook_url }}',
                   webhook_token: '${{ inputs.webhook_token }}',
                   areas: '${{ inputs.areas }}',
