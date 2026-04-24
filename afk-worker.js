@@ -2,7 +2,8 @@ const bedrock = require('bedrock-protocol')
 const fs = require('fs')
 const http = require('http')
 const path = require('path')
-const { BedrockTaskHelper, createLogger, getAuthCacheDir, inspect, stripMcColorCodes } = require('./main')
+const { BedrockTaskHelper, createLogger, getAuthCacheDir, inspect, stripMcColorCodes, summarizeItem } = require('./main')
+const { findSkeletonSpawner, isSkeletonSpawnerSummary, shouldStartSpawnerHandoff } = require('./spawner-handoff')
 
 function buildRandomAreaPool(min = 10, max = 70) {
   const values = []
@@ -34,6 +35,10 @@ const DASHBOARD_REFRESH_MS = 60000
 const DASHBOARD_HOST = process.env.AFK_WEB_HOST || '127.0.0.1'
 const DASHBOARD_PORT = Number(process.env.AFK_WEB_PORT || 3020)
 const DASHBOARD_LOG_LIMIT = 240
+const AUTO_SPAWNER_ENABLED = process.env.AUTO_SPAWNER_ENABLED === 'true'
+const SPAWNER_SHARD_THRESHOLD = Number(process.env.SPAWNER_SHARD_THRESHOLD || 1500)
+const JAVA_MAIN_USERNAME = String(process.env.JAVA_MAIN_USERNAME || '').trim()
+const SPAWNER_HANDOFF_COOLDOWN_MS = Number(process.env.SPAWNER_HANDOFF_COOLDOWN_MS || 60000)
 function parseAreaList(raw) {
   if (!raw) return DEFAULT_AREAS
   return raw
@@ -392,7 +397,21 @@ const state = {
   lastShardValue: null,
   lastShardRaw: null,
   accountUsername: null,
-  accountXuid: null
+  accountXuid: null,
+  playerEntities: {},
+  spawnerHandoff: {
+    phase: 'idle',
+    lastRunAt: null,
+    lastError: null,
+    purchasedAt: null,
+    droppedAt: null
+  },
+  // --- Manager task system -------------------------------------------------
+  // activeTask: currently-executing task dispatched from manager via IPC.
+  // deathSignal: flipped to true when the player dies (detected via packets)
+  // and consumed by waitForDeath() inside the deliver-spawner flow.
+  activeTask: null,
+  deathSignal: false
 }
 
 const helper = new BedrockTaskHelper({
@@ -553,6 +572,7 @@ function resetJoinState({ keepSuccess = false } = {}) {
   state.lastShardRaw = null
   state.accountUsername = null
   state.accountXuid = null
+  state.playerEntities = {}
   helper.initializedSent = false
   helper.currentContainer = null
   scheduleDashboardBroadcast()
@@ -837,6 +857,7 @@ function getDashboardSnapshot() {
       display: stripMcColorCodes(objective.display_name || objective.objective_name || ''),
       slot: objective.display_slot || 'UNKNOWN'
     })),
+    spawnerHandoff: state.spawnerHandoff,
     logLines: dashboardLogBuffer.slice(-120)
   }
 }
@@ -984,6 +1005,32 @@ function captureAccountIdentity(client) {
   log(`[ACCOUNT] [USER:${accountUsername || 'UNKNOWN'}] [XUID:${accountXuid ?? 'UNKNOWN'}]`)
 }
 
+function entityKey(params) {
+  const id = params?.runtime_id ?? params?.runtime_entity_id ?? params?.entity_id ?? params?.unique_id
+  return id == null ? null : String(id)
+}
+
+function rememberPlayerEntity(params) {
+  const key = entityKey(params)
+  if (!key) return
+  state.playerEntities[key] = {
+    runtimeId: key,
+    username: params.username || params.name || params.display_name || '',
+    position: clonePosition(params.position)
+  }
+}
+
+function updatePlayerEntityPosition(params) {
+  const key = entityKey(params)
+  if (!key || !state.playerEntities[key]) return
+  state.playerEntities[key].position = clonePosition(params.position)
+}
+
+function forgetPlayerEntity(params) {
+  const key = entityKey(params)
+  if (key) delete state.playerEntities[key]
+}
+
 function handleConsoleCommand(input) {
   const command = String(input || '').trim().toLowerCase()
   if (!command) return
@@ -1021,12 +1068,455 @@ function handleConsoleCommand(input) {
   log(`[CONSOLE] [UNKNOWN] ${command}`)
 }
 
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function waitForPacket(name, predicate = () => true, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const client = state.client
+    if (!client) return reject(new Error('client not connected'))
+    const timer = setTimeout(() => {
+      client.off('packet', onPacket)
+      reject(new Error(`Timeout waiting for ${name}`))
+    }, timeoutMs)
+
+    function onPacket(packet) {
+      if (packet.data.name !== name) return
+      const params = packet.data.params
+      if (!predicate(params)) return
+      clearTimeout(timer)
+      client.off('packet', onPacket)
+      resolve({ params })
+    }
+
+    client.on('packet', onPacket)
+  })
+}
+
+function setSpawnerPhase(phase, extra = {}) {
+  state.spawnerHandoff = {
+    ...state.spawnerHandoff,
+    phase,
+    ...extra
+  }
+  log(`[SPAWNER] [PHASE:${phase}]`)
+  scheduleDashboardBroadcast()
+}
+
 function positionDistance(a, b) {
   if (!a || !b) return Infinity
   const dx = Number(a.x) - Number(b.x)
   const dy = Number(a.y) - Number(b.y)
   const dz = Number(a.z) - Number(b.z)
   return Math.sqrt(dx * dx + dy * dy + dz * dz)
+}
+
+async function buySkeletonSpawner() {
+  setSpawnerPhase('open_shop')
+  helper.sendCommand('/shop')
+
+  const mainMenu = await waitForPacket('inventory_content', params => {
+    return Array.isArray(params.input) && params.input[15] && params.input[15].network_id !== 0
+  }, 15000)
+
+  const mainWindowId = mainMenu.params.window_id
+  const shardItem = helper.getItemAt(mainWindowId, 15)
+  if (!shardItem || shardItem.empty) throw new Error('Shard shop slot not found')
+
+  setSpawnerPhase('click_shard_shop')
+  helper.clickWindowSlot(mainWindowId, 15, shardItem)
+
+  const shopPacket = await waitForPacket('inventory_content', params => {
+    if (!Array.isArray(params.input)) return false
+    const summarized = params.input.map((item, index) => summarizeItem(item, index))
+    return Boolean(findSkeletonSpawner(summarized))
+  }, 15000)
+
+  const shopWindowId = shopPacket.params.window_id
+  const shopItems = helper.getWindowItems(shopWindowId)
+
+  // Full dump of the shard shop window to help tune selectors.
+  log(`[SPAWNER] [SHOP_DUMP] window=${shopWindowId} slots=${shopItems.length}`)
+  for (const it of shopItems) {
+    if (!it || it.empty) continue
+    const name = (it.custom_name_clean || '').trim() || `(id=${it.network_id})`
+    const lore = Array.isArray(it.lore_clean) ? it.lore_clean.filter(Boolean).join(' | ') : ''
+    log(`  slot=${String(it.slot).padStart(2, ' ')}  x${it.count}  ${name}${lore ? '  // ' + lore : ''}`)
+  }
+
+  const target = findSkeletonSpawner(shopItems)
+  if (!target) throw new Error('Skeleton spawner not found in shard shop')
+
+  const targetLabel = (target.custom_name_clean || '').trim() || `id=${target.network_id}`
+  log(`[SPAWNER] [SHOP_PICK] window=${shopWindowId} slot=${target.slot} name="${targetLabel}"`)
+  setSpawnerPhase('click_skeleton_spawner')
+  helper.clickWindowSlot(shopWindowId, target.slot, target)
+
+  // DonutSMP may either (a) open a confirm window, or (b) purchase instantly.
+  // Wait briefly for a NEW container window; if none shows up, assume instant-buy
+  // and fall through to the post-buy inventory check.
+  const isPlayerOrShop = (wid) => (
+    wid === shopWindowId ||
+    wid === 0 || wid === '0' ||
+    wid === 'inventory' || wid === 'cursor' || wid === 'offhand' || wid === 'armor' ||
+    wid === -1 || wid === -2 || wid === -3
+  )
+
+  try {
+    const confirmPacket = await waitForPacket('inventory_content', params => {
+      if (!Array.isArray(params.input)) return false
+      if (isPlayerOrShop(params.window_id)) return false
+      return params.input.some(item => item && item.network_id !== 0)
+    }, 3000)
+
+    const confirmWindowId = confirmPacket.params.window_id
+    const confirmItemsRaw = confirmPacket.params.input.map((item, index) => summarizeItem(item, index))
+    const confirmItem = (confirmItemsRaw[15] && !confirmItemsRaw[15].empty)
+      ? confirmItemsRaw[15]
+      : confirmItemsRaw.find(item => item && !item.empty)
+
+    if (confirmItem && !confirmItem.empty) {
+      log(`[SPAWNER] [CONFIRM] window=${confirmWindowId} slot=${confirmItem.slot} name=${confirmItem.name || confirmItem.network_id}`)
+      setSpawnerPhase('confirm_purchase')
+      helper.clickWindowSlot(confirmWindowId, confirmItem.slot, confirmItem)
+    } else {
+      const dump = confirmItemsRaw
+        .filter(it => it && !it.empty)
+        .map(it => `slot=${it.slot} name=${it.name || it.network_id}`)
+        .join(', ') || '(no items)'
+      log(`[SPAWNER] [CONFIRM_SKIP] window=${confirmWindowId} no selectable item; dump=[${dump}]`)
+    }
+  } catch (err) {
+    // Timeout or other — assume instant-buy variant.
+    log(`[SPAWNER] [NO_CONFIRM_WINDOW] assuming instant-buy (${compactReason(err?.message || err, 28)})`)
+  }
+
+  state.spawnerHandoff.purchasedAt = new Date().toISOString()
+}
+
+async function tpaToJavaMain() {
+  if (!JAVA_MAIN_USERNAME) throw new Error('JAVA_MAIN_USERNAME is not configured')
+  setSpawnerPhase('tpa_to_java')
+  helper.sendCommand(`/tpa ${JAVA_MAIN_USERNAME}`)
+
+  const startedAt = Date.now()
+  let tick = 0
+  while (Date.now() - startedAt < 60000) {
+    const players = Object.values(state.playerEntities || {})
+    const target = players.find(entity => String(entity.username || '').toLowerCase().includes(JAVA_MAIN_USERNAME.toLowerCase()))
+    if (target?.position && state.currentPosition && positionDistance(target.position, state.currentPosition) <= 10) {
+      log(`[SPAWNER] [TPA_JOINED] java=${target.username} dist=${positionDistance(target.position, state.currentPosition).toFixed(1)}`)
+      setSpawnerPhase('teleported')
+      return true
+    }
+    // Every 5s, log who we can see, so we know why proximity isn't matching.
+    if (tick % 5 === 0) {
+      const visible = players
+        .map(e => e.username)
+        .filter(Boolean)
+        .slice(0, 10)
+        .join(', ') || '(none)'
+      log(`[SPAWNER] [TPA_WAIT] elapsed=${Math.floor((Date.now()-startedAt)/1000)}s target="${JAVA_MAIN_USERNAME}" visible=[${visible}]`)
+    }
+    tick += 1
+    await wait(1000)
+  }
+
+  throw new Error('TPA timeout waiting for Java main proximity')
+}
+
+async function dropSkeletonSpawnerToJava() {
+  setSpawnerPhase('dropping_spawner')
+
+  // DonutSMP teleport has a ~5s countdown after /tpaccept; wait for it to finish
+  // so we actually drop the item next to Java main, not at the AFK spot.
+  log('[SPAWNER] [DROP_WAIT] sleeping 6s for teleport countdown to finish')
+  await wait(6000)
+
+  const found = helper.findInventoryItem(isSkeletonSpawnerSummary)
+  if (!found) throw new Error('No skeleton spawner in inventory to drop')
+
+  const item = found.item
+  const slot = item.slot
+  const count = item.count || 1
+  const raw = item.raw_item || {}
+
+  log(`[SPAWNER] [DROP_ITEM_META] net=${item.network_id} has_nbt=${item.has_nbt} name="${item.custom_name_clean || ''}" slot=${slot} window=${found.windowId}`)
+  try {
+    const snaps = helper.containerSnapshots || {}
+    const windows = Object.keys(snaps).map(k => `${k}:${(snaps[k]?.slots || []).filter(s => s && !s.empty).length}`).join(', ')
+    log(`[SPAWNER] [DROP_WINDOWS] ${windows}`)
+  } catch {}
+
+  // Build Item struct matching bedrock-protocol Item definition for 1.21.x.
+  // Key rules learned from the protocol JSON + Item.toBedrock() reference:
+  //  - has_nbt is a MAPPER over lu16 (0='false', 65535='true') — bool OK
+  //  - nbt field is only serialized when has_nbt is true; carry the exact
+  //    parsed NBT from the inbound packet so the server recognises the item
+  //  - extra layout is ItemExtraDataWithoutBlockingTick for non-shield items
+  //    (no blocking_tick field for spawner)
+  //  - Missing fields cause "sizeOf error for undefined" in the serializer
+  const buildItem = (overrideCount) => {
+    const extra = {
+      has_nbt: !!raw.extra?.has_nbt,
+      can_place_on: raw.extra?.can_place_on || [],
+      can_destroy: raw.extra?.can_destroy || []
+    }
+    if (extra.has_nbt) {
+      // Preserve the original NBT exactly as received so the server sees
+      // the item as identical (display name, lore, custom data).
+      extra.nbt = raw.extra.nbt
+    }
+    return {
+      network_id: item.network_id,
+      count: overrideCount,
+      metadata: item.metadata || 0,
+      has_stack_id: 1,
+      stack_id: item.stack_id || 0,
+      block_runtime_id: item.block_runtime_id || 0,
+      extra
+    }
+  }
+
+  const airItem = {
+    network_id: 0,
+    count: 0,
+    metadata: 0,
+    has_stack_id: 0,
+    block_runtime_id: 0,
+    extra: { has_nbt: false, can_place_on: [], can_destroy: [] }
+  }
+
+  const sourceItem = buildItem(count)
+
+  // Classic Bedrock drop: inventory_transaction type="normal" with a pair
+  // of balanced actions. Action 1 removes the item from the player's
+  // inventory container; Action 2 releases the same item into the world.
+  // item_release / drop_item action_type does NOT exist in 1.21 protocol.
+  const wireWindow = slot < 9 ? 'hotbar' : 'inventory'
+  const wireSlot = slot < 9 ? slot : slot - 9
+  log(`[SPAWNER] [DROP_TRY] transaction_type=normal window=${wireWindow} wire_slot=${wireSlot} raw_slot=${slot} stack_id=${item.stack_id || 0}`)
+  state.client.write('inventory_transaction', {
+    transaction: {
+      legacy: { legacy_request_id: 0, legacy_transactions: [] },
+      transaction_type: 'normal',
+      actions: [
+        {
+          source_type: 'container',
+          // bedrock-protocol merges the 9 hotbar slots + 27 main inventory
+          // slots into a single "inventory" snapshot window (36 slots total).
+          // On the wire however, the server tracks them as SEPARATE windows:
+          //   - slot 0-8  => hotbar window (id=122)
+          //   - slot 9-35 => inventory window (id=0), indexed 0-26
+          // Pick the correct window for our slot and translate the index.
+          inventory_id: slot < 9 ? 'hotbar' : 'inventory',
+          slot: slot < 9 ? slot : slot - 9,
+          old_item: sourceItem,
+          new_item: airItem
+        },
+        {
+          source_type: 'world_interaction',
+          flags: 0,
+          slot: 0,
+          old_item: airItem,
+          new_item: sourceItem
+        }
+      ],
+      transaction_data: 'void'
+    }
+  })
+
+  // Poll up to 5s for the spawner to leave inventory.
+  const deadline = Date.now() + 5000
+  while (Date.now() < deadline) {
+    if (!helper.findInventoryItem(isSkeletonSpawnerSummary)) {
+      log('[SPAWNER] [DROP_OK] spawner left inventory')
+      setSpawnerPhase('dropped', { droppedAt: new Date().toISOString() })
+      return
+    }
+    await wait(400)
+  }
+
+  log('[SPAWNER] [DROP_STILL_IN_INV] spawner did not leave inventory after 5s')
+  throw new Error('Drop failed — spawner still in inventory')
+}
+
+// --- Task system (IPC-driven) -------------------------------------------
+// Tasks are dispatched from the manager via:
+//   process.send({ type: 'task', kind: 'deliver_spawner', id, data })
+// The worker executes one task at a time; manager polls with {type:'poll_tasks'}
+// every 15s as a safety net if the push was missed.
+
+function emitTaskState(extra = {}) {
+  if (!state.activeTask) return
+  state.activeTask = { ...state.activeTask, ...extra, updatedAt: new Date().toISOString() }
+  scheduleDashboardBroadcast()
+  if (process.env.IS_WORKER === 'true' && process.send) {
+    process.send({ type: 'task_state', data: state.activeTask })
+  }
+}
+
+function setTaskPhase(phase, extra = {}) {
+  if (!state.activeTask) return
+  log(`[TASK] [PHASE:${phase}]${Object.keys(extra).length ? ' ' + JSON.stringify(extra) : ''}`)
+  emitTaskState({ phase, ...extra })
+}
+
+function taskDone(outcome, detail = null) {
+  const task = state.activeTask
+  if (!task) return
+  const finished = { ...task, outcome, detail, finishedAt: new Date().toISOString() }
+  log(`[TASK] [${String(task.kind).toUpperCase()}] [DONE:${outcome}]${detail ? ' ' + compactReason(detail, 60) : ''}`)
+  state.activeTask = null
+  scheduleDashboardBroadcast()
+  if (process.env.IS_WORKER === 'true' && process.send) {
+    process.send({ type: 'task_done', data: finished })
+  }
+}
+
+function signalDeath(reason = 'health_zero') {
+  state.deathSignal = true
+  log(`[DEATH] [DETECTED] [REASON:${reason}]`)
+}
+
+async function awaitTargetProximity(targetUsername, timeoutMs = 60000) {
+  const startedAt = Date.now()
+  let tick = 0
+  while (Date.now() - startedAt < timeoutMs) {
+    if (!state.activeTask) return false // cancelled
+    const players = Object.values(state.playerEntities || {})
+    const entity = players.find(e => String(e.username || '').toLowerCase().includes(targetUsername.toLowerCase()))
+    if (entity?.position && state.currentPosition && positionDistance(entity.position, state.currentPosition) <= 10) {
+      return true
+    }
+    if (tick % 10 === 0) {
+      const visible = players.map(e => e.username).filter(Boolean).slice(0, 8).join(', ') || '(none)'
+      log(`[TASK] [TPA_WAIT] elapsed=${Math.floor((Date.now() - startedAt) / 1000)}s target="${targetUsername}" visible=[${visible}]`)
+    }
+    tick += 1
+    await wait(1000)
+  }
+  return false
+}
+
+async function tpaRetryLoop(targetUsername) {
+  let attempt = 0
+  while (state.activeTask) {
+    attempt += 1
+    helper.sendCommand(`/tpa ${targetUsername}`)
+    log(`[TASK] [TPA_SENT] attempt=${attempt} target=${targetUsername} waiting 60s for accept`)
+    const joined = await awaitTargetProximity(targetUsername, 60000)
+    if (joined) {
+      log(`[TASK] [TPA_ACCEPTED] arrived near ${targetUsername}`)
+      return true
+    }
+    log('[TASK] [TPA_TIMEOUT] no accept in 60s — retrying')
+  }
+  throw new Error('Task cancelled during TPA')
+}
+
+async function waitForDeath(timeoutMs = 30 * 60 * 1000) {
+  state.deathSignal = false
+  const deadline = Date.now() + timeoutMs
+  while (state.activeTask && Date.now() < deadline) {
+    if (state.deathSignal) {
+      state.deathSignal = false
+      return true
+    }
+    await wait(500)
+  }
+  if (!state.activeTask) throw new Error('Task cancelled while waiting for death')
+  throw new Error('Timed out waiting for death (30m)')
+}
+
+async function runDeliverSpawnerTask(task) {
+  if (state.activeTask) {
+    log(`[TASK] [REJECT] another task active (${state.activeTask.kind})`)
+    if (process.send) process.send({ type: 'task_rejected', data: { id: task.id, reason: 'busy' } })
+    return
+  }
+
+  const target = String(task?.data?.targetUsername || JAVA_MAIN_USERNAME || '').trim()
+  if (!target) {
+    log('[TASK] [REJECT] no TPA target configured')
+    if (process.send) process.send({ type: 'task_done', data: { ...task, outcome: 'failed', detail: 'no tpa target' } })
+    return
+  }
+
+  state.activeTask = {
+    ...task,
+    phase: 'init',
+    startedAt: new Date().toISOString(),
+    target
+  }
+  scheduleDashboardBroadcast()
+  log(`[TASK] [DELIVER_SPAWNER] [START] target=${target}`)
+
+  // Keep legacy spawnerHandoff phase in sync so existing drift/rejoin guards
+  // continue to treat us as "busy".
+  setSpawnerPhase('task_active')
+
+  try {
+    if (!state.afkSuccess) throw new Error('Bot not yet in AFK area')
+
+    // Dump current inventory for diagnostics.
+    const invDump = (helper.getWindowItems('inventory') || [])
+      .filter(it => it && !it.empty)
+      .map(it => `slot=${it.slot} x${it.count} ${(it.custom_name_clean || '').trim() || `(id=${it.network_id})`}`)
+    log(`[TASK] [INV_DUMP] items=${invDump.length}${invDump.length ? ' => ' + invDump.join(' | ') : ' (empty)'}`)
+
+    // --- Phase 1: ensure we have a spawner ---
+    let spawner = helper.findInventoryItem(isSkeletonSpawnerSummary)
+    if (!spawner) {
+      setTaskPhase('buying')
+      await buySkeletonSpawner()
+      const deadline = Date.now() + 8000
+      while (Date.now() < deadline && !spawner) {
+        spawner = helper.findInventoryItem(isSkeletonSpawnerSummary)
+        if (spawner) break
+        await wait(500)
+      }
+      if (!spawner) throw new Error('Purchase did not produce spawner in inventory')
+      log(`[TASK] [BOUGHT_OK] slot=${spawner.item.slot}`)
+    } else {
+      log(`[TASK] [ALREADY_HAS] slot=${spawner.item.slot}`)
+    }
+
+    // --- Phase 2: TPA loop until accept ---
+    setTaskPhase('tpa_waiting', { target })
+    await tpaRetryLoop(target)
+
+    // --- Phase 3: wait for user to kill us ---
+    setTaskPhase('waiting_for_kill', { target })
+    log(`[TASK] [AWAITING_KILL] you may now kill ${state.accountUsername || 'the bot'} to loot the spawner`)
+    await waitForDeath()
+
+    // --- Phase 4: respawn and resume AFK ---
+    setTaskPhase('respawning')
+    await wait(3000) // let respawn packet settle
+    log('[TASK] [RESUME_AFK] dispatching /afk to rejoin area')
+    clearAfkTimeout()
+    state.afkSuccess = false
+    state.afkAttemptInFlight = false
+    state.lastRejoinAt = Date.now()
+    setTimeout(tryJoinCurrentArea, 500)
+
+    taskDone('success')
+    setSpawnerPhase('cooldown')
+  } catch (err) {
+    const detail = String(err?.message || err)
+    log(`[TASK] [FAILED] ${compactReason(detail, 60)}`)
+    taskDone('failed', detail)
+    setSpawnerPhase('failed', { lastError: detail })
+  }
+}
+
+function cancelActiveTask(reason = 'cancelled') {
+  if (!state.activeTask) return
+  log(`[TASK] [CANCEL] ${reason}`)
+  taskDone('cancelled', reason)
+  setSpawnerPhase('idle')
 }
 
 function captureAfkAnchor(reason) {
@@ -1087,6 +1577,16 @@ function markAfkSuccess(reason) {
 }
 
 function scheduleRejoin(reason, { immediate = false, allowAreaAdvance = false } = {}) {
+  // Never rejoin while spawner handoff is active — the bot is intentionally
+  // away from its AFK anchor (teleported to Java main). Rejoining now would
+  // drag the bot off before it can drop the spawner.
+  const phase = state.spawnerHandoff?.phase
+  const handoffActive = phase && !['idle', 'cooldown', 'failed'].includes(phase)
+  if (handoffActive) {
+    log(`[AFK] [REJOIN_SKIP] handoff phase=${phase} reason=${compactReason(reason, 32)}`)
+    return
+  }
+
   if (allowAreaAdvance) {
     state.afkSuccess = false
     moveToNextArea(reason)
@@ -1217,6 +1717,16 @@ function handlePostSuccessChat(cleanMessage) {
 function checkAfkPositionDrift(reason = 'interval') {
   if (!state.afkSuccess || !state.afkAnchorPosition || !state.currentPosition) return
   if (!canTriggerRejoinNow()) return
+
+  // Skip drift check while spawner handoff is in progress — the TPA teleport
+  // is INTENTIONAL movement and must not trigger an auto /afk rejoin that
+  // would drag the bot away before the spawner is dropped.
+  const phase = state.spawnerHandoff?.phase
+  const handoffActive = phase && !['idle', 'cooldown', 'failed'].includes(phase)
+  if (handoffActive) {
+    log(`[AFK] [DRIFT_SKIP] handoff phase=${phase}`)
+    return
+  }
 
   const distance = positionDistance(state.currentPosition, state.afkAnchorPosition)
   if (distance < AFK_DRIFT_DISTANCE) return
@@ -1466,11 +1976,21 @@ function createAndWireClient() {
       helper.updateInventorySlot(params.window_id, params.slot, params.item || params)
     }
 
+    if (name === 'add_player') {
+      rememberPlayerEntity(params)
+    }
+
+    if (name === 'remove_entity') {
+      forgetPlayerEntity(params)
+    }
+
     if (name === 'move_player') {
       const runtimeId = params.runtime_id ?? params.runtime_entity_id
       if (client.entityId != null && String(runtimeId) === String(client.entityId)) {
         updateCurrentPosition(params.position, `move_player:${params.mode || 'unknown'}`)
         checkAfkPositionDrift(`move_player:${params.mode || 'unknown'}`)
+      } else {
+        updatePlayerEntityPosition(params)
       }
     }
 
@@ -1478,9 +1998,24 @@ function createAndWireClient() {
       updateScoreboardObjective(params)
     }
 
+    // --- Death detection (for IPC deliver_spawner task) ---
+    // Bedrock signals death through either `set_health` with health=0 or
+    // through the server sending an `event` packet / respawn flow. Flag
+    // the deathSignal whenever health drops to 0 while a task is awaiting
+    // it. Also treat receipt of a `respawn` packet with state=search as a
+    // death confirmation in case we missed the health edge.
+    if (name === 'set_health' && Number(params?.health) <= 0) {
+      if (state.activeTask?.phase === 'waiting_for_kill') signalDeath('set_health=0')
+    }
+    if (name === 'respawn' && state.activeTask?.phase === 'waiting_for_kill') {
+      signalDeath(`respawn:${params?.state || 'unknown'}`)
+    }
+
     if (name === 'set_score') {
       updateScoreboardEntries(params)
       refreshShardState()
+      // Auto-spawner trigger removed — spawner delivery is now manager-driven
+      // via IPC tasks (see runDeliverSpawnerTask).
     }
 
     if (name === 'text') {
@@ -1544,6 +2079,39 @@ setInterval(() => {
 setInterval(() => {
   checkAfkPositionDrift('interval')
 }, AFK_DRIFT_CHECK_MS)
+
+// --- IPC: receive tasks from manager ------------------------------------
+if (process.env.IS_WORKER === 'true') {
+  process.on('message', (msg) => {
+    if (!msg || typeof msg !== 'object') return
+    try {
+      if (msg.type === 'task' && msg.kind === 'deliver_spawner') {
+        const task = { kind: 'deliver_spawner', id: msg.id, data: msg.data || {} }
+        runDeliverSpawnerTask(task).catch(err => {
+          log(`[TASK] [HANDLER_ERR] ${compactReason(err?.message || err, 60)}`)
+        })
+      } else if (msg.type === 'cancel_task') {
+        cancelActiveTask(msg.reason || 'manager_cancel')
+      }
+    } catch (err) {
+      log(`[IPC] [ERR] ${compactReason(err?.message || err, 60)}`)
+    }
+  })
+
+  // Every 15s ping the manager for any pending task (safety net if the
+  // IPC push was missed, e.g. worker restart). Manager replies with a
+  // {type:'task', kind, id, data} message when a task is queued.
+  setInterval(() => {
+    if (!process.send) return
+    try {
+      process.send({
+        type: 'poll_tasks',
+        hasActiveTask: Boolean(state.activeTask),
+        activeTaskKind: state.activeTask?.kind || null
+      })
+    } catch {}
+  }, 15000)
+}
 
 setInterval(() => {
   scheduleDashboardBroadcast()

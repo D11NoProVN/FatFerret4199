@@ -39,6 +39,9 @@ Actions → AFK Bot → Run workflow, điền:
 - `webhook_token`: token xác thực
 - `areas` (tùy chọn): `10,20,30,...`
 - `run_duration_sec`: mặc định `20400` (5h40m)
+- `java_main_username`: tên tài khoản Java chính để PE bot gửi `/tpa`
+- `auto_spawner_enabled`: `true` để tự mua skeleton spawner và handoff về Java main
+- `spawner_shard_threshold`: mặc định `1500`
 - `chain`: `true` để auto-restart, `false` one-shot
 
 ## Lưu ý

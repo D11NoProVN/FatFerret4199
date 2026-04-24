@@ -480,6 +480,15 @@ class BedrockTaskHelper {
     return this.getWindowItems(windowId).filter(item => item && !item.empty && predicate(item))
   }
 
+  findInventoryItem(predicate) {
+    const windows = ['inventory', 0, '0']
+    for (const windowId of windows) {
+      const item = this.getWindowItems(windowId).find(x => x && !x.empty && predicate(x))
+      if (item) return { windowId, item }
+    }
+    return null
+  }
+
   captureWindowTransition(previousWindowId, windowId, summarized, keyPrefix = 'transition') {
     if (isPlayerWindow(windowId)) return null
 
@@ -644,6 +653,44 @@ class BedrockTaskHelper {
     })
 
     this.log(`[CLICK] inventory_transaction window=${windowId} inventory_id=${inventoryId} slot=${slot}`)
+  }
+
+  sendDropInventoryItem(windowId, slot, itemSummary = null, count = 1) {
+    if (!this.client) throw new Error('client is not set')
+
+    const summary = itemSummary || this.getItemAt(windowId, slot)
+    if (!summary || summary.empty) {
+      throw new Error(`Cannot drop empty or missing slot ${slot} in window ${windowId}`)
+    }
+
+    const oldItem = cloneForPacket(summary.raw_item)
+    const newItem = count >= (summary.count || 1)
+      ? makeAirItem()
+      : cloneForPacket({ ...summary.raw_item, count: (summary.count || 1) - count })
+
+    this.client.write('inventory_transaction', {
+      transaction: {
+        legacy: { legacy_request_id: 0, legacy_transactions: [] },
+        transaction_type: 'item_release',
+        actions: [
+          {
+            source_type: 'container',
+            inventory_id: translateWindowId(windowId),
+            slot,
+            old_item: oldItem,
+            new_item: newItem
+          }
+        ],
+        transaction_data: {
+          action_type: 'drop_item',
+          hotbar_slot: slot,
+          item_in_hand: oldItem,
+          head_position: { x: 0, y: 0, z: 0 }
+        }
+      }
+    })
+
+    this.log(`[DROP] inventory_transaction window=${windowId} slot=${slot} count=${count}`)
   }
 
   extractFormData(packet) {
@@ -1203,6 +1250,10 @@ class BotSession extends EventEmitter {
 
   async clickWindowSlot(windowId, slot, itemSummary = null) {
     return this.helper.clickWindowSlot(windowId, slot, itemSummary)
+  }
+
+  async dropInventoryItem(windowId, slot, itemSummary = null, count = 1) {
+    return this.helper.sendDropInventoryItem(windowId, slot, itemSummary, count)
   }
 
   async runTask(taskId, options = {}) {

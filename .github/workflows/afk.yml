@@ -23,6 +23,18 @@ on:
         description: "Bot tự exit sau bao nhiêu giây (default 5h40m)"
         required: false
         default: "20400"
+      java_main_username:
+        description: "Java main account name for /tpa"
+        required: false
+        default: ""
+      auto_spawner_enabled:
+        description: "Auto buy skeleton spawner and handoff (true/false)"
+        required: false
+        default: "false"
+      spawner_shard_threshold:
+        description: "Shard threshold for skeleton spawner purchase"
+        required: false
+        default: "1500"
       chain:
         description: "Tự trigger job kế tiếp khi hết giờ (true/false)"
         required: false
@@ -90,6 +102,9 @@ jobs:
           WEBHOOK_TOKEN: ${{ inputs.webhook_token }}
           AFK_AREAS: ${{ inputs.areas }}
           RUN_DURATION_SEC: ${{ inputs.run_duration_sec }}
+          JAVA_MAIN_USERNAME: ${{ inputs.java_main_username }}
+          AUTO_SPAWNER_ENABLED: ${{ inputs.auto_spawner_enabled }}
+          SPAWNER_SHARD_THRESHOLD: ${{ inputs.spawner_shard_threshold }}
         run: node afk-worker.js
 
       - name: Trigger chain (self-restart)
@@ -112,6 +127,9 @@ jobs:
                   webhook_token: '${{ inputs.webhook_token }}',
                   areas: '${{ inputs.areas }}',
                   run_duration_sec: '${{ inputs.run_duration_sec }}',
+                  java_main_username: '${{ inputs.java_main_username }}',
+                  auto_spawner_enabled: '${{ inputs.auto_spawner_enabled }}',
+                  spawner_shard_threshold: '${{ inputs.spawner_shard_threshold }}',
                   chain: 'true'
                 }
               })
