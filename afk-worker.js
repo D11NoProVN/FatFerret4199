@@ -314,7 +314,9 @@ async function flushCloudQueue() {
       runId: process.env.GITHUB_RUN_ID || null,
       events: batch
     })
-    await new Promise((resolve) => {
+    // Capture response body so we can pick up manager→worker directives
+    // (tasks to run, cancels). This is the cloud analogue of IPC push.
+    const responsePayload = await new Promise((resolve) => {
       const req = lib.request(WEBHOOK_URL, {
         method: 'POST',
         headers: {
@@ -324,15 +326,24 @@ async function flushCloudQueue() {
         },
         timeout: 8000
       }, res => {
-        res.resume()
-        res.on('end', resolve)
-        res.on('error', resolve)
+        const chunks = []
+        res.on('data', c => chunks.push(c))
+        res.on('end', () => {
+          try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')) }
+          catch { resolve(null) }
+        })
+        res.on('error', () => resolve(null))
       })
-      req.on('error', () => resolve())
-      req.on('timeout', () => { try { req.destroy() } catch {}; resolve() })
+      req.on('error', () => resolve(null))
+      req.on('timeout', () => { try { req.destroy() } catch {}; resolve(null) })
       req.write(body)
       req.end()
     })
+
+    if (responsePayload && typeof responsePayload === 'object') {
+      try { applyCloudDirectives(responsePayload) }
+      catch (e) { log(`[CLOUD] [DIRECTIVE_ERR] ${compactReason(e?.message || e, 60)}`) }
+    }
   } catch {
     // nuốt lỗi, không crash bot
   } finally {
@@ -340,6 +351,40 @@ async function flushCloudQueue() {
     if (cloudQueue.length > 0) scheduleCloudFlush()
   }
 }
+// --- Cloud directive dispatcher ------------------------------------------
+// Called after each webhook flush with the manager's JSON response. If it
+// carries { tasks:[{type:'task', kind, id, data}] } we dispatch each one.
+// If it carries { cancelTask:{reason} } we abort the in-flight task.
+// We track IDs we've already started to avoid double-dispatch if the
+// manager re-sends on retry.
+const seenCloudTaskIds = new Set()
+function applyCloudDirectives(payload) {
+  if (payload.cancelTask) {
+    try { cancelActiveTask(payload.cancelTask.reason || 'cloud_cancel') } catch {}
+  }
+  if (Array.isArray(payload.tasks)) {
+    for (const t of payload.tasks) {
+      if (!t || !t.id || !t.kind) continue
+      if (seenCloudTaskIds.has(t.id)) continue
+      seenCloudTaskIds.add(t.id)
+      if (seenCloudTaskIds.size > 200) {
+        // trim oldest
+        const first = seenCloudTaskIds.values().next().value
+        seenCloudTaskIds.delete(first)
+      }
+      log(`[CLOUD] [TASK_RECV] kind=${t.kind} id=${String(t.id).slice(0, 8)}`)
+      if (t.kind === 'deliver_spawner') {
+        const taskObj = { kind: t.kind, id: t.id, data: t.data || {} }
+        runDeliverSpawnerTask(taskObj).catch(err => {
+          log(`[CLOUD] [TASK_ERR] ${compactReason(err?.message || err, 60)}`)
+        })
+      } else {
+        log(`[CLOUD] [TASK_UNKNOWN] kind=${t.kind}`)
+      }
+    }
+  }
+}
+
 let dashboardServer = null
 
 function appendDashboardLog(message) {
@@ -1355,6 +1400,7 @@ function emitTaskState(extra = {}) {
   if (process.env.IS_WORKER === 'true' && process.send) {
     process.send({ type: 'task_state', data: state.activeTask })
   }
+  cloudEnqueue('task_state', state.activeTask)
 }
 
 function setTaskPhase(phase, extra = {}) {
@@ -1373,6 +1419,7 @@ function taskDone(outcome, detail = null) {
   if (process.env.IS_WORKER === 'true' && process.send) {
     process.send({ type: 'task_done', data: finished })
   }
+  cloudEnqueue('task_done', finished)
 }
 
 function signalDeath(reason = 'health_zero') {
@@ -1433,14 +1480,18 @@ async function waitForDeath(timeoutMs = 30 * 60 * 1000) {
 async function runDeliverSpawnerTask(task) {
   if (state.activeTask) {
     log(`[TASK] [REJECT] another task active (${state.activeTask.kind})`)
-    if (process.send) process.send({ type: 'task_rejected', data: { id: task.id, reason: 'busy' } })
+    const payload = { id: task.id, reason: 'busy' }
+    if (process.send) process.send({ type: 'task_rejected', data: payload })
+    cloudEnqueue('task_rejected', payload)
     return
   }
 
   const target = String(task?.data?.targetUsername || JAVA_MAIN_USERNAME || '').trim()
   if (!target) {
     log('[TASK] [REJECT] no TPA target configured')
-    if (process.send) process.send({ type: 'task_done', data: { ...task, outcome: 'failed', detail: 'no tpa target' } })
+    const payload = { ...task, outcome: 'failed', detail: 'no tpa target' }
+    if (process.send) process.send({ type: 'task_done', data: payload })
+    cloudEnqueue('task_done', payload)
     return
   }
 
