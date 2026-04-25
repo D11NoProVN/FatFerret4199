@@ -445,7 +445,7 @@ const state = {
   lastRejoinAt: null,
   lastActivityAt: null,
   authInputInterval: null,
-  authInputTick: 0n,
+  authInputTick: 1n,
   authInputPacketCount: 0,
   authInputConsecutiveErrors: 0,
   pendingTeleportAckPackets: 0,
@@ -666,7 +666,7 @@ function resetJoinState({ keepSuccess = false } = {}) {
   state.lastActivityAt = null
   state.lastConnectProgressAt = null
   state.connectPhase = 'idle'
-  state.authInputTick = 0n
+  state.authInputTick = 1n
   state.authInputPacketCount = 0
   state.authInputConsecutiveErrors = 0
   state.pendingTeleportAckPackets = 0
@@ -708,11 +708,14 @@ function compactReason(reason, maxLength = 48) {
   return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text
 }
 
-function coerceTick(value, fallback = 0n) {
-  if (typeof value === 'bigint') return value
-  if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.max(0, Math.floor(value)))
-  if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value)
-  return fallback
+function coerceTick(value, fallback = 1n) {
+  const base = fallback > 0n ? fallback : 1n
+  let parsed = null
+  if (typeof value === 'bigint') parsed = value
+  else if (typeof value === 'number' && Number.isFinite(value)) parsed = BigInt(Math.floor(value))
+  else if (typeof value === 'string' && /^\d+$/.test(value)) parsed = BigInt(value)
+  if (parsed == null || parsed <= 0n) return base
+  return parsed < base ? base : parsed
 }
 
 function authInputTickStep() {
@@ -770,6 +773,7 @@ function shouldSendMovePlayer() {
 function buildAuthInputPacket() {
   const position = clonePosition(state.currentPosition)
   if (!position) return null
+  if (state.authInputTick <= 0n) state.authInputTick = 1n
   const look = getHeartbeatLook()
   const inputData = { received_server_data: true }
   if (state.pendingTeleportAckPackets > 0) inputData.handled_teleport = true
@@ -796,6 +800,7 @@ function buildAuthInputPacket() {
 function buildMovePlayerPacket() {
   const position = clonePosition(state.currentPosition)
   if (!position || !state.client || state.client.entityId == null) return null
+  if (state.authInputTick <= 0n) state.authInputTick = 1n
   const look = getHeartbeatLook()
   return {
     runtime_id: Number(state.client.entityId),
@@ -2122,6 +2127,7 @@ function createAndWireClient() {
 
   const client = bedrock.createClient(clientOptions)
   markConnectProgress('client_created')
+  markConnectProgress('authenticating')
 
   // Safety net: gắn error listener ngay để tránh crash nếu error fire trước khi handler chính gắn
   // (hoặc sau khi client.close() gọi removeAllListeners)
@@ -2144,6 +2150,17 @@ function createAndWireClient() {
   client.on('connect', () => {
     markConnectProgress('connect')
     log('[EVENT] [CONNECT]')
+  })
+
+  client.on('session', () => {
+    markConnectProgress('auth_session')
+    captureAccountIdentity(client)
+    log('[EVENT] [AUTH_SESSION]')
+  })
+
+  client.on('loggingIn', () => {
+    markConnectProgress('login_sent')
+    log('[EVENT] [LOGIN_SENT]')
   })
 
   client.on('join', () => {
