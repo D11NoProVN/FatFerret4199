@@ -1,57 +1,36 @@
-name: AFK Bot
+name: KingMC Java Bot
 
 on:
   workflow_dispatch:
     inputs:
       account_id:
-        description: "Account ID (UUID, dùng để tên folder auth-cache)"
-        required: true
-      secret_suffix:
-        description: "Suffix của secret name (đã sanitize A-Z/0-9/_)"
+        description: "Account ID"
         required: true
       webhook_url:
-        description: "HTTPS endpoint của manager local (ngrok/cloudflare tunnel URL)"
+        description: "Webhook URL"
         required: true
       webhook_token:
-        description: "Token xác thực webhook"
+        description: "Webhook Token"
         required: true
-      areas:
-        description: "Danh sách AFK area cách nhau dấu phẩy (trống = random 10-70)"
+      mc_username:
+        description: "Minecraft Username"
+        required: true
+      mc_password:
+        description: "Minecraft Password"
         required: false
-        default: ""
+        default: "zennopro11"
+      server_host:
+        description: "Server Host"
+        required: false
+        default: "kingmc.vn"
       run_duration_sec:
-        description: "Bot tự exit sau bao nhiêu giây (default 5h40m)"
+        description: "Run Duration"
         required: false
         default: "20400"
-      java_main_username:
-        description: "Java main account name for /tpa"
-        required: false
-        default: ""
-      auto_spawner_enabled:
-        description: "Auto buy skeleton spawner and handoff (true/false)"
-        required: false
-        default: "false"
-      spawner_shard_threshold:
-        description: "Shard threshold for skeleton spawner purchase"
-        required: false
-        default: "1500"
-      chain:
-        description: "Tự trigger job kế tiếp khi hết giờ (true/false)"
-        required: false
-        default: "true"
-
-permissions:
-  actions: write
-  contents: read
-
-concurrency:
-  group: afk-${{ inputs.account_id }}
-  cancel-in-progress: false
 
 jobs:
   afk:
     runs-on: ubuntu-latest
-    timeout-minutes: 355  # 5h55m, để lại ~5 phút cho chain step
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,55 +41,22 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        run: npm install --omit=dev --no-audit --no-fund
+        run: npm install --omit=dev
 
-      - name: Restore MSA cache bundle from secret
-        env:
-          MSA_CACHE_B64: ${{ secrets[format('MSA_CACHE_{0}', inputs.secret_suffix)] }}
-          ACCOUNT_ID: ${{ inputs.account_id }}
-        run: |
-          if [ -z "$MSA_CACHE_B64" ]; then
-            echo "::error::Missing repo secret MSA_CACHE_${{ inputs.secret_suffix }}"
-            exit 1
-          fi
-          mkdir -p ".auth-cache/$ACCOUNT_ID"
-          node -e "
-            const fs = require('fs');
-            const path = require('path');
-            const zlib = require('zlib');
-            const b64 = process.env.MSA_CACHE_B64;
-            const gz = Buffer.from(b64, 'base64');
-            const json = zlib.gunzipSync(gz).toString('utf8');
-            const data = JSON.parse(json);
-            const dir = path.join('.auth-cache', process.env.ACCOUNT_ID);
-            let total = 0;
-            for (const [name, content] of Object.entries(data.files || {})) {
-              const fp = path.join(dir, name);
-              fs.writeFileSync(fp, content, 'utf8');
-              total += Buffer.byteLength(content);
-              console.log('  [' + Buffer.byteLength(content) + 'B] ' + fp);
-            }
-            console.log('Restored ' + Object.keys(data.files).length + ' cache files, total ' + total + ' bytes');
-          "
-
-      - name: Run AFK Bot
+      - name: Run Java Bot
         env:
           CLOUD_MODE: "true"
-          IS_WORKER: "false"
           ACCOUNT_ID: ${{ inputs.account_id }}
           WEBHOOK_URL: ${{ inputs.webhook_url }}
           WEBHOOK_TOKEN: ${{ inputs.webhook_token }}
-          AFK_AREAS: ${{ inputs.areas }}
+          MC_USERNAME: ${{ inputs.mc_username }}
+          MC_PASSWORD: ${{ inputs.mc_password }}
+          SERVER_HOST: ${{ inputs.server_host }}
           RUN_DURATION_SEC: ${{ inputs.run_duration_sec }}
-          JAVA_MAIN_USERNAME: ${{ inputs.java_main_username }}
-          AUTO_SPAWNER_ENABLED: ${{ inputs.auto_spawner_enabled }}
-          SPAWNER_SHARD_THRESHOLD: ${{ inputs.spawner_shard_threshold }}
         run: node afk-worker.js
 
-      - name: Trigger chain (self-restart)
-        # !cancelled() = chạy cả khi success/failure, NHƯNG skip khi user cancel run.
-        # Nhờ vậy bấm Cancel trên GitHub (hoặc Undeploy trong manager) sẽ dừng hẳn chain.
-        if: ${{ !cancelled() && inputs.chain == 'true' }}
+      - name: Chain Restart
+        if: always()
         uses: actions/github-script@v7
         with:
           script: |
@@ -122,18 +68,12 @@ jobs:
                 ref: context.ref,
                 inputs: {
                   account_id: '${{ inputs.account_id }}',
-                  secret_suffix: '${{ inputs.secret_suffix }}',
                   webhook_url: '${{ inputs.webhook_url }}',
                   webhook_token: '${{ inputs.webhook_token }}',
-                  areas: '${{ inputs.areas }}',
-                  run_duration_sec: '${{ inputs.run_duration_sec }}',
-                  java_main_username: '${{ inputs.java_main_username }}',
-                  auto_spawner_enabled: '${{ inputs.auto_spawner_enabled }}',
-                  spawner_shard_threshold: '${{ inputs.spawner_shard_threshold }}',
-                  chain: 'true'
+                  mc_username: '${{ inputs.mc_username }}',
+                  mc_password: '${{ inputs.mc_password }}',
+                  server_host: '${{ inputs.server_host }}',
+                  run_duration_sec: '${{ inputs.run_duration_sec }}'
                 }
               })
-              core.info('Chain dispatch scheduled successfully')
-            } catch (err) {
-              core.warning('Chain dispatch failed: ' + err.message)
-            }
+            } catch (err) {}
